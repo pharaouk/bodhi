@@ -23,6 +23,7 @@ import argparse
 from transformers import (
     set_seed,
     Seq2SeqTrainer,
+    TrainerCallback
 )
 from datasets import load_dataset, Dataset
 import evaluate
@@ -75,6 +76,96 @@ def train():
         args=training_args,
         **{k: v for k, v in data_module.items() if k != "predict_dataset"},
     )
+
+    import threading
+
+    class SyncModelsCallbackA(TrainerCallback):
+        def __init__(self, modelA, modelB, condition, global_step):
+            self.modelA = modelA
+            self.modelB = modelB
+            self.outputB = None
+            self.condition = condition
+            self.global_step = global_step
+
+        def on_step_begin(self, args, state, control, model=None, **kwargs):
+            with self.condition:
+                # Ensure that modelA does not start the next step without modelB finishing the last step
+                while self.global_step.value != state.global_step:
+                    self.condition.wait()
+
+                outputA = self.modelA(**kwargs)
+                kwargs['input_ids'] = torch.cat([kwargs['input_ids'], outputA[0]], dim=-1)
+                self.condition.notify()  # Notify modelB that it can proceed
+
+            return kwargs
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.outputB = kwargs['outputs']
+            with self.condition:
+                self.condition.wait()  # Wait for modelA to finish its step
+
+    class SyncModelsCallbackB(TrainerCallback):
+        def __init__(self, modelA, modelB, condition, global_step):
+            self.modelA = modelA
+            self.modelB = modelB
+            self.condition = condition
+            self.global_step = global_step
+
+        def on_step_end(self, args, state, control, **kwargs):
+            with self.condition:
+                # Ensure that modelB does not start until modelA finishes the current step
+                while self.global_step.value != state.global_step:
+                    self.condition.wait()
+
+    # Initialize your trainers
+    condition = threading.Condition()
+    global_step = threading.Value('i', 0)
+    modelA = model
+    modelB = model
+    class CustomTrainerA(Seq2SeqTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            outputA = model(**inputs)
+            # Model A's loss is determined by the output of model B plus a loss calculated by other means
+            lossA = some_loss_function(outputA, self.callback_handler.callbacks[0].outputB) + 1  # Assuming SyncModelsCallbackA is the first callback
+
+            with self.callback_handler.callbacks[0].condition:
+                self.callback_handler.callbacks[0].global_step.value += 1
+                self.callback_handler.callbacks[0].condition.notify()  # Notify modelB that it can proceed
+
+            return (lossA, outputA) if return_outputs else lossA
+
+    class CustomTrainerB(Seq2SeqTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            # Model B's loss is determined normally
+            outputs = model(**inputs)
+            if "labels" in inputs:
+                labels = inputs.pop("labels")
+            else:
+                labels = inputs.pop("lm_labels")
+            lossB = model(**inputs)[0]
+
+            with self.callback_handler.callbacks[0].condition:
+                self.callback_handler.callbacks[0].condition.notify()  # Notify modelA that it can proceed
+
+            return (lossB, outputs) if return_outputs else lossB
+    trainerA = CustomTrainerA(
+        callbacks=[SyncModelsCallbackA(modelA, modelB, condition, global_step)],
+        model=modelA,
+        tokenizer=tokenizer,
+        args=training_args,
+        **{k: v for k, v in data_module.items() if k != "predict_dataset"},
+    )
+
+    
+
+    trainerB = CustomTrainerB(
+        model=modelB,
+        args=training_args,
+        callbacks=[SyncModelsCallbackB(modelA, modelB, condition, global_step)],
+        tokenizer=tokenizer,
+        args=training_args,
+        **{k: v for k, v in data_module.items() if k != "predict_dataset"},    )
+
 
     # Callbacks
     if not args.full_finetune:
@@ -163,15 +254,24 @@ def train():
     all_metrics = {"run_name": args.run_name}
     # Training
     if args.do_train:
-        logger.info("*** Train ***")
-        # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
-        # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
-        train_result = trainer.train()
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-        all_metrics.update(metrics)
+        def train_launch(trainers):
+            logger.info("*** Train ***")
+            # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
+            # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
+            train_result = trainers.train()
+            metrics = train_result.metrics
+            trainers.log_metrics("train", metrics)
+            trainers.save_metrics("train", metrics)
+            trainers.save_state()
+            all_metrics.update(metrics)
+                # Train your models in separate threads
+        threadA = threading.Thread(target=train_launch(trainerA))
+        threadB = threading.Thread(target=train_launch(trainerB))
+        threadA.start()
+        threadB.start()
+        threadA.join()
+        threadB.join()
+
     # Evaluation
     if args.do_eval:
         logger.info("*** Evaluate ***")
